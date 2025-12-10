@@ -131,6 +131,7 @@
             const textLayerRef = useRef(null);
             const fileInputRef = useRef(null);
             const viewerContainerRef = useRef(null);
+            const renderTaskRef = useRef(null); // Track active render tasks
             
             const DEFAULT_PDF_URL = "paper.pdf"; 
 
@@ -142,22 +143,33 @@
             }, []);
 
             const loadPdf = async (source, name) => {
+                if (!source) return;
+                
                 setIsLoading(true);
                 try {
-                    // Create config object conditionally to avoid undefined 'url' property error
-                    const config = {
+                    let data = source;
+
+                    // If it's a string URL (e.g., 'paper.pdf'), fetch it first
+                    // This bypasses PDF.js URL handling which caused errors, normalizing everything to data.
+                    if (typeof source === 'string') {
+                        const response = await fetch(source);
+                        if (!response.ok) {
+                            throw new Error(`Failed to fetch PDF: ${response.statusText}`);
+                        }
+                        const buffer = await response.arrayBuffer();
+                        data = new Uint8Array(buffer);
+                    } else if (!(source instanceof Uint8Array) && !(source instanceof ArrayBuffer)) {
+                        throw new Error("Invalid source type");
+                    }
+
+                    // Now we only pass 'data' to getDocument, never 'url'
+                    const loadingTask = pdfjsLib.getDocument({
+                        data: data,
                         cMapUrl: 'https://unpkg.com/pdfjs-dist@3.11.174/cmaps/',
                         cMapPacked: true,
                         standardFontDataUrl: 'https://unpkg.com/pdfjs-dist@3.11.174/standard_fonts/'
-                    };
+                    });
 
-                    if (typeof source === 'string') {
-                        config.url = source;
-                    } else {
-                        config.data = source;
-                    }
-
-                    const loadingTask = pdfjsLib.getDocument(config);
                     const pdf = await loadingTask.promise;
                     setPdfDoc(pdf);
                     setNumPages(pdf.numPages);
@@ -180,13 +192,20 @@
                 loadPdf(DEFAULT_PDF_URL, "我们的故事 (paper.pdf)");
             }, []);
 
-            // High DPI Rendering & Text Layer
+            // High DPI Rendering & Text Layer with Cancellation
             useEffect(() => {
                 if (!pdfDoc || !canvasRef.current || !textLayerRef.current) return;
                 
-                let isCancelled = false;
-
                 const renderPage = async () => {
+                    // Cancel previous render task if it exists to avoid canvas conflicts
+                    if (renderTaskRef.current) {
+                        try {
+                            await renderTaskRef.current.cancel();
+                        } catch (error) {
+                            // Ignore cancellation errors
+                        }
+                    }
+
                     try {
                         const page = await pdfDoc.getPage(currentPage);
                         const viewport = page.getViewport({ scale });
@@ -214,54 +233,45 @@
                             transform: transform
                         };
                         
-                        // Render Canvas
-                        await page.render(renderContext).promise;
+                        // Render Canvas (Store task in ref)
+                        const renderTask = page.render(renderContext);
+                        renderTaskRef.current = renderTask;
 
-                        if (isCancelled) return;
+                        await renderTask.promise;
 
-                        // Render Text Layer (for selection)
-                        const textLayerDiv = textLayerRef.current;
-                        textLayerDiv.innerHTML = ""; // Clear previous
-                        textLayerDiv.style.width = Math.floor(viewport.width) + "px";
-                        textLayerDiv.style.height = Math.floor(viewport.height) + "px";
-                        // Align text layer exactly with canvas
-                        textLayerDiv.style.setProperty('--scale-factor', viewport.scale);
+                        // Render Text Layer (for selection) - Only if render wasn't cancelled
+                        if (renderTaskRef.current === renderTask) {
+                            const textLayerDiv = textLayerRef.current;
+                            textLayerDiv.innerHTML = ""; // Clear previous
+                            textLayerDiv.style.width = Math.floor(viewport.width) + "px";
+                            textLayerDiv.style.height = Math.floor(viewport.height) + "px";
+                            textLayerDiv.style.setProperty('--scale-factor', viewport.scale);
 
-                        const textContent = await page.getTextContent();
-                        if (isCancelled) return;
-
-                        pdfjsLib.renderTextLayer({
-                            textContentSource: textContent,
-                            container: textLayerDiv,
-                            viewport: viewport,
-                            textDivs: []
-                        });
-
+                            const textContent = await page.getTextContent();
+                            pdfjsLib.renderTextLayer({
+                                textContentSource: textContent,
+                                container: textLayerDiv,
+                                viewport: viewport,
+                                textDivs: []
+                            });
+                        }
                     } catch (err) { 
-                        console.error("Page render error:", err); 
+                        // Ignore rendering cancelled errors
+                        if (err.name !== 'RenderingCancelledException') {
+                            console.error("Page render error:", err);
+                        }
                     }
                 };
+
                 renderPage();
                 
-                return () => { isCancelled = true; };
+                // Cleanup
+                return () => {
+                    if (renderTaskRef.current) {
+                        renderTaskRef.current.cancel();
+                    }
+                };
             }, [pdfDoc, currentPage, scale]);
-
-            // Scroll / Swipe Navigation Logic
-            const handleScroll = (e) => {
-                if (!pdfDoc) return;
-                const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
-                const buffer = 20; // threshold pixels
-
-                // Check if we are at bottom
-                if (scrollHeight - scrollTop - clientHeight < buffer) {
-                    // We are at bottom. If user scrolls MORE, we go next.
-                    // Since we can't easily detect "scroll more" without movement, 
-                    // we rely on the user hitting the bottom and doing it again or just momentum.
-                    // A simple debounce is needed to prevent rapid firing.
-                    // However, standard browser behavior stops scroll at bottom.
-                    // We can implement a "wheel" listener for better control on desktop.
-                }
-            };
 
             // Enhanced Wheel/Touch Logic for Page Turning
             useEffect(() => {
@@ -288,7 +298,6 @@
                         // Scrolling Up at Top
                         setCurrentPage(p => p - 1);
                         lastScrollTime = now;
-                        // container.scrollTo(0, scrollHeight); // Optional: go to bottom of prev page? default top is better
                     }
                 };
                 
