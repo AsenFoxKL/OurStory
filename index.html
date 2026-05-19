@@ -275,35 +275,30 @@
                         const page = await pdfDoc.getPage(currentPage);
                         const viewport = page.getViewport({ scale });
                         
-                        // Calculate optimal output scale to maintain sharpness at various zoom/browser-zoom levels
-                        // Higher combinedScale = more pixels = sharper when zoomed
-                        const browserScale = window.visualViewport?.scale || 1;
-                        const devicePixelRatio = window.devicePixelRatio || 1;
-                        // Use the greater of devicePixelRatio or a minimum threshold, scaled by our PDF scale
-                        const optimalScale = Math.max(devicePixelRatio, 2) * (scale / 1.2);
+                        // Get device pixel ratio for sharp rendering
+                        const dpr = window.devicePixelRatio || 1;
 
                         const canvas = canvasRef.current;
                         const context = canvas.getContext('2d');
 
-                        // Set canvas internal dimensions for high resolution
-                        canvas.width = Math.floor(viewport.width * optimalScale);
-                        canvas.height = Math.floor(viewport.height * optimalScale);
+                        // Set canvas internal dimensions with DPR for sharp rendering
+                        // Set canvas display size (CSS pixels)
                         canvas.style.width = Math.floor(viewport.width) + "px";
                         canvas.style.height = Math.floor(viewport.height) + "px";
+                        // Set canvas internal resolution (actual pixels)
+                        canvas.width = Math.floor(viewport.width * dpr);
+                        canvas.height = Math.floor(viewport.height * dpr);
 
-                        // Clear any CSS image-rendering hints that might cause blur
+                        // Scale context to match internal resolution
+                        context.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                        // Ensure high quality rendering
                         context.imageSmoothingEnabled = true;
                         context.imageSmoothingQuality = 'high';
 
-                        // Use identity transform for crisp rendering, scale is applied to dimensions
-                        const transform = optimalScale !== 1 
-                            ? [optimalScale, 0, 0, optimalScale, 0, 0] 
-                            : null;
-
                         const renderContext = {
                             canvasContext: context,
-                            viewport: viewport,
-                            transform: transform
+                            viewport: viewport
                         };
                         
                         // Render Canvas (Store task in ref)
@@ -354,10 +349,13 @@
                 }
             }, [currentPage]);
 
-            // Wheel/Touch Page Turning
+            // Desktop-only wheel scroll page turning (mobile uses buttons)
             useEffect(() => {
                 const container = viewerContainerRef.current;
                 if (!container || !pdfDoc) return;
+
+                // Only enable wheel page turning on desktop (non-touch devices)
+                if ('ontouchstart' in window) return;
 
                 let isWheelDisabled = false;
                 const DISABLE_DURATION = 800;
@@ -401,66 +399,10 @@
                     }
                 };
 
-                const handleTouchStart = (e) => {
-                    if (e.touches.length === 1) {
-                        container._touchStartY = e.touches[0].clientY;
-                        container._touchStartTime = Date.now();
-                    }
-                };
-
-                const handleTouchEnd = (e) => {
-                    if (e.changedTouches.length !== 1 || isWheelDisabled) return;
-
-                    const endY = e.changedTouches[0].clientY;
-                    const deltaY = container._touchStartY - endY;
-                    const deltaTime = Date.now() - container._touchStartTime;
-                    const velocity = Math.abs(deltaY) / deltaTime;
-
-                    const { scrollTop, scrollHeight, clientHeight } = container;
-                    const canScroll = scrollHeight - clientHeight > 10;
-                    const isAtTop = scrollTop <= 5;
-                    const isAtBottom = scrollHeight - scrollTop - clientHeight <= 5;
-
-                    const MIN_SWIPE = 50;
-                    const MIN_VELOCITY = 0.2;
-
-                    if (Math.abs(deltaY) > MIN_SWIPE && velocity > MIN_VELOCITY) {
-                        if (canScroll) {
-                            if (deltaY > 0 && isAtBottom && currentPage < numPages) {
-                                setCurrentPage(p => p + 1);
-                                isWheelDisabled = true;
-                                setTimeout(() => {
-                                    isWheelDisabled = false;
-                                }, DISABLE_DURATION);
-                            } else if (deltaY < 0 && isAtTop && currentPage > 1) {
-                                setCurrentPage(p => p - 1);
-                                isWheelDisabled = true;
-                                setTimeout(() => {
-                                    isWheelDisabled = false;
-                                }, DISABLE_DURATION);
-                            }
-                        } else {
-                            if (deltaY > 0 && currentPage < numPages) {
-                                setCurrentPage(p => p + 1);
-                            } else if (deltaY < 0 && currentPage > 1) {
-                                setCurrentPage(p => p - 1);
-                            }
-                            isWheelDisabled = true;
-                            setTimeout(() => {
-                                isWheelDisabled = false;
-                            }, DISABLE_DURATION);
-                        }
-                    }
-                };
-
                 container.addEventListener('wheel', handleWheel, { passive: false });
-                container.addEventListener('touchstart', handleTouchStart, { passive: true });
-                container.addEventListener('touchend', handleTouchEnd, { passive: true });
 
                 return () => {
                     container.removeEventListener('wheel', handleWheel);
-                    container.removeEventListener('touchstart', handleTouchStart);
-                    container.removeEventListener('touchend', handleTouchEnd);
                 };
             }, [pdfDoc, currentPage, numPages]);
 
