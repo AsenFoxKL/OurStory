@@ -131,9 +131,18 @@
             const textLayerRef = useRef(null);
             const fileInputRef = useRef(null);
             const viewerContainerRef = useRef(null);
-            const renderTaskRef = useRef(null); // Track active render tasks
-            
-            const DEFAULT_PDF_URL = "paper.pdf"; 
+            const renderTaskRef = useRef(null);
+            const pageWidthRef = useRef(595); // Default, will be updated from PDF
+
+            const DEFAULT_PDF_URL = "paper.pdf";
+
+            // Responsive scale based on container width
+            const getResponsiveScale = (containerWidth) => {
+                const isMobile = window.innerWidth < 768;
+                const padding = isMobile ? 16 : 40;
+                const availableWidth = containerWidth - padding;
+                return Math.max(availableWidth / pageWidthRef.current, 0.5);
+            };
 
             // Initialize: Check mobile to auto-close sidebar
             useEffect(() => {
@@ -141,6 +150,42 @@
                     setIsSidebarOpen(false);
                 }
             }, []);
+
+            // Update scale when container size changes
+            useEffect(() => {
+                const updateScale = () => {
+                    const container = viewerContainerRef.current;
+                    if (container) {
+                        const rect = container.getBoundingClientRect();
+                        if (rect.width > 0) {
+                            const newScale = getResponsiveScale(rect.width);
+                            setScale(newScale);
+                        }
+                    }
+                };
+
+                const timeoutId = setTimeout(updateScale, 50);
+                window.addEventListener('resize', updateScale);
+                return () => {
+                    clearTimeout(timeoutId);
+                    window.removeEventListener('resize', updateScale);
+                };
+            }, []);
+
+            // Update scale when sidebar toggles
+            useEffect(() => {
+                const timeoutId = setTimeout(() => {
+                    const container = viewerContainerRef.current;
+                    if (container) {
+                        const rect = container.getBoundingClientRect();
+                        if (rect.width > 0) {
+                            const newScale = getResponsiveScale(rect.width);
+                            setScale(newScale);
+                        }
+                    }
+                }, 350);
+                return () => clearTimeout(timeoutId);
+            }, [isSidebarOpen]);
 
             const loadPdf = async (source, name) => {
                 if (!source) return;
@@ -175,6 +220,26 @@
                     setNumPages(pdf.numPages);
                     setCurrentPage(1);
                     setFileName(name);
+
+                    // Get actual page width for responsive scaling
+                    const firstPage = await pdf.getPage(1);
+                    const viewport = firstPage.getViewport({ scale: 1 });
+                    pageWidthRef.current = viewport.width;
+
+                    // Apply responsive scale after getting page dimensions
+                    setTimeout(() => {
+                        const container = viewerContainerRef.current;
+                        if (container) {
+                            const rect = container.getBoundingClientRect();
+                            if (rect.width > 0) {
+                                const isMobile = window.innerWidth < 768;
+                                const padding = isMobile ? 16 : 40;
+                                const availableWidth = rect.width - padding;
+                                const newScale = Math.max(availableWidth / pageWidthRef.current, 0.5);
+                                setScale(newScale);
+                            }
+                        }
+                    }, 50);
                 } catch (error) {
                     console.error("Error loading PDF:", error);
                     if (typeof source !== 'string') {
@@ -210,21 +275,29 @@
                         const page = await pdfDoc.getPage(currentPage);
                         const viewport = page.getViewport({ scale });
                         
-                        // Support HiDPI-screens (Retina)
-                        const outputScale = window.devicePixelRatio || 1;
+                        // Calculate optimal output scale to maintain sharpness at various zoom/browser-zoom levels
+                        // Higher combinedScale = more pixels = sharper when zoomed
+                        const browserScale = window.visualViewport?.scale || 1;
+                        const devicePixelRatio = window.devicePixelRatio || 1;
+                        // Use the greater of devicePixelRatio or a minimum threshold, scaled by our PDF scale
+                        const optimalScale = Math.max(devicePixelRatio, 2) * (scale / 1.2);
 
                         const canvas = canvasRef.current;
                         const context = canvas.getContext('2d');
 
-                        // Set dimensions based on scale
-                        canvas.width = Math.floor(viewport.width * outputScale);
-                        canvas.height = Math.floor(viewport.height * outputScale);
+                        // Set canvas internal dimensions for high resolution
+                        canvas.width = Math.floor(viewport.width * optimalScale);
+                        canvas.height = Math.floor(viewport.height * optimalScale);
                         canvas.style.width = Math.floor(viewport.width) + "px";
                         canvas.style.height = Math.floor(viewport.height) + "px";
 
-                        // Transform context to handle HiDPI scaling
-                        const transform = outputScale !== 1 
-                            ? [outputScale, 0, 0, outputScale, 0, 0] 
+                        // Clear any CSS image-rendering hints that might cause blur
+                        context.imageSmoothingEnabled = true;
+                        context.imageSmoothingQuality = 'high';
+
+                        // Use identity transform for crisp rendering, scale is applied to dimensions
+                        const transform = optimalScale !== 1 
+                            ? [optimalScale, 0, 0, optimalScale, 0, 0] 
                             : null;
 
                         const renderContext = {
@@ -273,62 +346,116 @@
                 };
             }, [pdfDoc, currentPage, scale]);
 
-            // Enhanced Wheel/Touch Logic for Page Turning
+            // Reset scroll position when page changes
+            useEffect(() => {
+                const container = viewerContainerRef.current;
+                if (container) {
+                    container.scrollTop = 0;
+                }
+            }, [currentPage]);
+
+            // Wheel/Touch Page Turning
             useEffect(() => {
                 const container = viewerContainerRef.current;
                 if (!container || !pdfDoc) return;
 
-                let lastScrollTime = 0;
-                const COOLDOWN = 800; // ms between auto-page turns
+                let isWheelDisabled = false;
+                const DISABLE_DURATION = 800;
 
                 const handleWheel = (e) => {
-                    const now = Date.now();
-                    if (now - lastScrollTime < COOLDOWN) return;
+                    if (isWheelDisabled) return;
 
                     const { scrollTop, scrollHeight, clientHeight } = container;
-                    const isAtBottom = Math.abs(scrollHeight - clientHeight - scrollTop) < 5;
-                    const isAtTop = scrollTop < 5;
+                    const canScroll = scrollHeight - clientHeight > 10;
 
-                    if (e.deltaY > 0 && isAtBottom && currentPage < numPages) {
-                        // Scrolling Down at Bottom
-                        setCurrentPage(p => p + 1);
-                        lastScrollTime = now;
-                        container.scrollTo(0, 0); // Reset scroll for new page
-                    } else if (e.deltaY < 0 && isAtTop && currentPage > 1) {
-                        // Scrolling Up at Top
-                        setCurrentPage(p => p - 1);
-                        lastScrollTime = now;
+                    if (canScroll) {
+                        const isAtTop = scrollTop <= 5;
+                        const isAtBottom = scrollHeight - scrollTop - clientHeight <= 5;
+
+                        if (e.deltaY > 0 && isAtBottom && currentPage < numPages) {
+                            e.preventDefault();
+                            setCurrentPage(p => p + 1);
+                            isWheelDisabled = true;
+                            setTimeout(() => {
+                                isWheelDisabled = false;
+                            }, DISABLE_DURATION);
+                        } else if (e.deltaY < 0 && isAtTop && currentPage > 1) {
+                            e.preventDefault();
+                            setCurrentPage(p => p - 1);
+                            isWheelDisabled = true;
+                            setTimeout(() => {
+                                isWheelDisabled = false;
+                            }, DISABLE_DURATION);
+                        }
+                    } else {
+                        e.preventDefault();
+                        if (e.deltaY > 0 && currentPage < numPages) {
+                            setCurrentPage(p => p + 1);
+                        } else if (e.deltaY < 0 && currentPage > 1) {
+                            setCurrentPage(p => p - 1);
+                        }
+                        isWheelDisabled = true;
+                        setTimeout(() => {
+                            isWheelDisabled = false;
+                        }, DISABLE_DURATION);
                     }
                 };
-                
-                // Simple Touch logic
-                let touchStartY = 0;
-                const handleTouchStart = (e) => { touchStartY = e.touches[0].clientY; };
+
+                const handleTouchStart = (e) => {
+                    if (e.touches.length === 1) {
+                        container._touchStartY = e.touches[0].clientY;
+                        container._touchStartTime = Date.now();
+                    }
+                };
+
                 const handleTouchEnd = (e) => {
-                    const now = Date.now();
-                    if (now - lastScrollTime < COOLDOWN) return;
+                    if (e.changedTouches.length !== 1 || isWheelDisabled) return;
 
-                    const touchEndY = e.changedTouches[0].clientY;
-                    const diff = touchStartY - touchEndY; // positive = swipe up (scroll down)
-                    
+                    const endY = e.changedTouches[0].clientY;
+                    const deltaY = container._touchStartY - endY;
+                    const deltaTime = Date.now() - container._touchStartTime;
+                    const velocity = Math.abs(deltaY) / deltaTime;
+
                     const { scrollTop, scrollHeight, clientHeight } = container;
-                    const isAtBottom = Math.abs(scrollHeight - clientHeight - scrollTop) < 5;
-                    const isAtTop = scrollTop < 5;
-                    const SWIPE_THRESHOLD = 50;
+                    const canScroll = scrollHeight - clientHeight > 10;
+                    const isAtTop = scrollTop <= 5;
+                    const isAtBottom = scrollHeight - scrollTop - clientHeight <= 5;
 
-                    if (diff > SWIPE_THRESHOLD && isAtBottom && currentPage < numPages) {
-                         setCurrentPage(p => p + 1);
-                         lastScrollTime = now;
-                         container.scrollTo(0, 0);
-                    } else if (diff < -SWIPE_THRESHOLD && isAtTop && currentPage > 1) {
-                         setCurrentPage(p => p - 1);
-                         lastScrollTime = now;
+                    const MIN_SWIPE = 50;
+                    const MIN_VELOCITY = 0.2;
+
+                    if (Math.abs(deltaY) > MIN_SWIPE && velocity > MIN_VELOCITY) {
+                        if (canScroll) {
+                            if (deltaY > 0 && isAtBottom && currentPage < numPages) {
+                                setCurrentPage(p => p + 1);
+                                isWheelDisabled = true;
+                                setTimeout(() => {
+                                    isWheelDisabled = false;
+                                }, DISABLE_DURATION);
+                            } else if (deltaY < 0 && isAtTop && currentPage > 1) {
+                                setCurrentPage(p => p - 1);
+                                isWheelDisabled = true;
+                                setTimeout(() => {
+                                    isWheelDisabled = false;
+                                }, DISABLE_DURATION);
+                            }
+                        } else {
+                            if (deltaY > 0 && currentPage < numPages) {
+                                setCurrentPage(p => p + 1);
+                            } else if (deltaY < 0 && currentPage > 1) {
+                                setCurrentPage(p => p - 1);
+                            }
+                            isWheelDisabled = true;
+                            setTimeout(() => {
+                                isWheelDisabled = false;
+                            }, DISABLE_DURATION);
+                        }
                     }
                 };
 
-                container.addEventListener('wheel', handleWheel);
-                container.addEventListener('touchstart', handleTouchStart);
-                container.addEventListener('touchend', handleTouchEnd);
+                container.addEventListener('wheel', handleWheel, { passive: false });
+                container.addEventListener('touchstart', handleTouchStart, { passive: true });
+                container.addEventListener('touchend', handleTouchEnd, { passive: true });
 
                 return () => {
                     container.removeEventListener('wheel', handleWheel);
